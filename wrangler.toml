@@ -1,0 +1,8 @@
+name = "sonyliv-proxy"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ORIGIN_BASE = "https://tulnit.fun"
+REQUIRED_REFERER = "https://tulnit.fun/hot/sliv/play.php?id=978d48bb0639a9271d0b40bd421e4729"
