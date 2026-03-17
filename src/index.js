@@ -9,31 +9,61 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    // /proxy-segment?url=... — for rewritten m3u8 segment URLs
+    // Debug endpoint — visit /debug to verify worker is alive and see what origin returns
+    if (url.pathname === "/debug") {
+      const testUrl = ORIGIN_BASE + "/sliv/stream.php?id=1000009248&e=.m3u8";
+      let status, body, ct;
+      try {
+        const r = await fetch(testUrl, {
+          headers: {
+            "Referer": REQUIRED_REFERER,
+            "Origin": ORIGIN_BASE,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+            "Accept": "*/*",
+          },
+          redirect: "follow",
+        });
+        status = r.status;
+        ct = r.headers.get("content-type");
+        body = await r.text();
+      } catch (e) {
+        body = "fetch error: " + e.message;
+        status = 0;
+      }
+      return new Response(
+        JSON.stringify({ status, contentType: ct, body: body.slice(0, 2000) }, null, 2),
+        { headers: { "Content-Type": "application/json", ...corsHeaders() } }
+      );
+    }
+
+    // Segment passthrough for rewritten m3u8 lines
     if (url.pathname === "/proxy-segment") {
       const target = url.searchParams.get("url");
       if (!target) return new Response("Missing url param", { status: 400 });
-      return proxyUrl(target, request);
+      return proxyUrl(decodeURIComponent(target), url);
     }
 
-    // Everything else: forward to origin
-    const originUrl = ORIGIN_BASE + url.pathname + url.search;
-    return proxyUrl(originUrl, request);
+    // Pass full raw URL path+search to origin, preserving special chars
+    // Use request.url to extract everything after the worker domain
+    const afterDomain = request.url.slice(url.origin.length); // e.g. /sliv/stream.php?id=...&e=.m3u8
+    const originUrl = ORIGIN_BASE + afterDomain;
+
+    return proxyUrl(originUrl, url);
   },
 };
 
-async function proxyUrl(originUrl, request) {
-  const url = new URL(request.url);
-
-  const originRequest = new Request(originUrl, {
-    method: request.method,
-    headers: buildHeaders(request),
-    redirect: "follow",
-  });
-
+async function proxyUrl(originUrl, proxyUrl) {
   let response;
   try {
-    response = await fetch(originRequest);
+    response = await fetch(originUrl, {
+      headers: {
+        "Referer": REQUIRED_REFERER,
+        "Origin": ORIGIN_BASE,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+        "Accept": "*/*",
+      },
+      redirect: "follow",
+    });
   } catch (err) {
     return new Response("Upstream error: " + err.message, { status: 502 });
   }
@@ -42,11 +72,19 @@ async function proxyUrl(originUrl, request) {
   const isPlaylist =
     originUrl.includes(".m3u8") ||
     contentType.includes("mpegurl") ||
-    contentType.includes("x-mpegurl");
+    contentType.includes("x-mpegurl") ||
+    contentType.includes("text/plain");
 
   if (isPlaylist) {
     const text = await response.text();
-    const rewritten = rewriteM3U8(text, url);
+    // If it's actually a redirect or error page, return as-is for debugging
+    if (!text.includes("#EXTM3U") && response.status !== 200) {
+      return new Response(text, {
+        status: response.status,
+        headers: { "Content-Type": "text/plain", ...corsHeaders() },
+      });
+    }
+    const rewritten = rewriteM3U8(text, proxyUrl);
     return new Response(rewritten, {
       status: response.status,
       headers: {
@@ -59,7 +97,6 @@ async function proxyUrl(originUrl, request) {
 
   const newHeaders = new Headers(response.headers);
   Object.entries(corsHeaders()).forEach(([k, v]) => newHeaders.set(k, v));
-  newHeaders.set("Cache-Control", "public, max-age=10");
 
   return new Response(response.body, {
     status: response.status,
@@ -81,18 +118,6 @@ function rewriteM3U8(text, proxyUrl) {
       return `${proxyUrl.origin}/proxy-segment?url=${encodeURIComponent(absolute)}`;
     })
     .join("\n");
-}
-
-function buildHeaders(request) {
-  const headers = new Headers();
-  for (const [key, value] of request.headers.entries()) {
-    if (["accept", "accept-encoding", "accept-language", "range", "user-agent"].includes(key.toLowerCase())) {
-      headers.set(key, value);
-    }
-  }
-  headers.set("Referer", REQUIRED_REFERER);
-  headers.set("Origin", ORIGIN_BASE);
-  return headers;
 }
 
 function corsHeaders() {
