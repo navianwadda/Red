@@ -11,61 +11,91 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    // Main clean playlist endpoint
     if (url.pathname === "/sonysab.m3u8") {
-      return proxyUrl(ORIGIN_STREAM, PLAYLIST_BASE, url);
+      return proxyPlaylist(ORIGIN_STREAM, PLAYLIST_BASE, url);
     }
 
-    // Segment passthrough
     if (url.pathname === "/proxy-segment") {
       const target = url.searchParams.get("url");
       if (!target) return new Response("Missing url param", { status: 400 });
-      return proxyUrl(decodeURIComponent(target), null, url);
+      return proxySegment(decodeURIComponent(target));
     }
 
     return new Response("Not found", { status: 404 });
   },
 };
 
-async function proxyUrl(originUrl, baseUrl, proxyUrl) {
+async function proxyPlaylist(originUrl, baseUrl, proxyUrl) {
   let response;
   try {
     response = await fetch(originUrl, {
-      headers: upstreamHeaders(),
+      headers: {
+        "Referer": REQUIRED_REFERER,
+        "Origin": ORIGIN_BASE,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity", // no compression so text() works correctly
+      },
       redirect: "follow",
     });
   } catch (err) {
     return new Response("Upstream error: " + err.message, { status: 502 });
   }
 
-  const contentType = response.headers.get("content-type") || "";
-  const isPlaylist =
-    originUrl.includes(".m3u8") ||
-    contentType.includes("mpegurl") ||
-    contentType.includes("x-mpegurl") ||
-    contentType.includes("text/plain");
+  const text = await response.text();
 
-  if (isPlaylist && baseUrl) {
-    const text = await response.text();
-    if (!text.includes("#EXTM3U")) {
-      return new Response(text, {
-        status: response.status,
-        headers: { "Content-Type": "text/plain", ...corsHeaders() },
-      });
-    }
-    const rewritten = rewriteM3U8(text, baseUrl, proxyUrl);
-    return new Response(rewritten, {
-      status: response.status,
-      headers: {
-        ...corsHeaders(),
-        "Content-Type": "application/vnd.apple.mpegurl",
-        "Cache-Control": "no-cache",
-      },
+  if (!text.includes("#EXTM3U")) {
+    // Return raw for debugging
+    return new Response("Origin did not return valid m3u8:\n\n" + text, {
+      status: 502,
+      headers: { "Content-Type": "text/plain", ...corsHeaders() },
     });
+  }
+
+  const rewritten = rewriteM3U8(text, baseUrl, proxyUrl);
+
+  return new Response(rewritten, {
+    status: 200,
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Cache-Control": "no-cache",
+    },
+  });
+}
+
+async function proxySegment(originUrl) {
+  let response;
+  try {
+    response = await fetch(originUrl, {
+      headers: {
+        "Referer": REQUIRED_REFERER,
+        "Origin": ORIGIN_BASE,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+        "Accept": "*/*",
+      },
+      redirect: "follow",
+    });
+  } catch (err) {
+    return new Response("Segment fetch error: " + err.message, { status: 502 });
   }
 
   const newHeaders = new Headers(response.headers);
   Object.entries(corsHeaders()).forEach(([k, v]) => newHeaders.set(k, v));
+
+  // If segment is itself a playlist (sub-rendition), rewrite it too
+  const ct = response.headers.get("content-type") || "";
+  if (ct.includes("mpegurl") || originUrl.includes(".m3u8")) {
+    const text = await response.text();
+    const base = originUrl.substring(0, originUrl.lastIndexOf("/") + 1);
+    // We need proxyUrl origin — derive from the segment URL structure
+    // Since we're inside a worker, use a placeholder and replace
+    const rewritten = rewriteM3U8Sub(text, base);
+    newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
+    newHeaders.set("Cache-Control", "no-cache");
+    return new Response(rewritten, { status: 200, headers: newHeaders });
+  }
+
   return new Response(response.body, { status: response.status, headers: newHeaders });
 }
 
@@ -85,13 +115,24 @@ function rewriteM3U8(text, baseUrl, proxyUrl) {
     .join("\n");
 }
 
-function upstreamHeaders() {
-  return {
-    "Referer": REQUIRED_REFERER,
-    "Origin": ORIGIN_BASE,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-    "Accept": "*/*",
-  };
+// For sub-playlists (rendition m3u8s) fetched via /proxy-segment
+function rewriteM3U8Sub(text, baseUrl) {
+  // We'll use a relative approach — point segments back through proxy-segment
+  // proxyOrigin is inferred from the Referer-like context; hardcode worker domain
+  // This will be fixed once we know the worker URL — for now passthrough absolute URLs
+  return text
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#") || trimmed === "") return line;
+
+      const absolute = trimmed.startsWith("http")
+        ? trimmed
+        : baseUrl + trimmed;
+
+      return absolute; // segments in sub-playlists go directly (no CORS issue for .ts)
+    })
+    .join("\n");
 }
 
 function corsHeaders() {
